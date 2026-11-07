@@ -274,7 +274,21 @@ fn finish(state: &mut State, zip: &[u8], from: &str) -> PluginMessage {
     PluginMessage::Exit
 }
 
+fn print_lines(lines: &[&str]) {
+    println(&lines.join("\n"));
+}
+
 fn ask_source() -> PluginMessage {
+    print_lines(&[
+        "",
+        "The beta key can be downloaded from either place Jotego publishes it:",
+        "  GitHub  - the private JTFPGA/jtbeta repo. Needs a GitHub account with sponsor access and a token.",
+        "            The most reliable option.",
+        "  Patreon - the newest Jotego post with jtbeta.zip. Needs your Patreon login cookie, which expires",
+        "            every few weeks, and Patreon can change its site without notice.",
+        "  Both    - tries GitHub first, then Patreon.",
+        "Your answers are saved on the SD card in Plugins/jotego-beta-key/config.json.",
+    ]);
     PluginMessage::Choice {
         name: Q_SOURCE.into(),
         query: format!("Where should {} come from?", key::KEY_ZIP),
@@ -283,16 +297,41 @@ fn ask_source() -> PluginMessage {
 }
 
 fn ask_token() -> PluginMessage {
+    print_lines(&[
+        "",
+        "Getting a GitHub token for the beta key:",
+        "  1. Have an active paid Jotego subscription, either on GitHub Sponsors (https://github.com/sponsors/jotego)",
+        "     or on Patreon with your Patreon account linked to GitHub so GitHub counts you as a sponsor:",
+        "     https://docs.github.com/en/sponsors/sponsoring-open-source-contributors/sponsoring-an-open-source-contributor-through-patreon",
+        "  2. Accept the invite to the JTFPGA/jtbeta repository once it arrives (check your GitHub notifications",
+        "     and email).",
+        "  3. Create a classic token at https://github.com/settings/tokens/new with the 'repo' scope ticked.",
+        "  4. Copy the token (it starts with ghp_) and paste it below.",
+        "Leave it blank to cancel.",
+    ]);
     PluginMessage::Text {
         name: Q_TOKEN.into(),
-        query: format!("Paste a GitHub token for an account with sponsor access to {}/{}:", key::GITHUB_OWNER, key::GITHUB_REPO),
+        query: format!("GitHub token with access to {}/{} (see the steps above):", key::GITHUB_OWNER, key::GITHUB_REPO),
     }
 }
 
 fn ask_cookie() -> PluginMessage {
+    print_lines(&[
+        "",
+        "Getting your Patreon session cookie:",
+        "  1. Open https://www.patreon.com in your browser and log in.",
+        "  2. Open the developer tools (F12, or Cmd+Option+I on a Mac).",
+        "  3. Go to the Application tab (Chrome, Edge, Brave) or the Storage tab (Firefox, Safari).",
+        "  4. Expand Cookies and select https://www.patreon.com.",
+        "  5. Find the row named session_id and copy its Value.",
+        "  6. Paste it below.",
+        "The cookie stops working if you log out of Patreon in that browser or when it expires (usually within",
+        "a few weeks); run this plugin again and paste a fresh one. It is only ever sent to patreon.com.",
+        "Leave it blank to cancel.",
+    ]);
     PluginMessage::Text {
         name: Q_COOKIE.into(),
-        query: "Paste the value of your Patreon 'session_id' cookie (from your browser, while logged in):".into(),
+        query: "Patreon session_id cookie value (see the steps above):".into(),
     }
 }
 
