@@ -306,12 +306,12 @@ fn ask_token() -> PluginMessage {
         "  2. Accept the invite to the JTFPGA/jtbeta repository once it arrives (check your GitHub notifications",
         "     and email).",
         "  3. Create a classic token at https://github.com/settings/tokens/new with the 'repo' scope ticked.",
-        "  4. Copy the token (it starts with ghp_) and paste it below.",
-        "Leave it blank to cancel.",
+        "  4. Copy the token (it starts with ghp_) and paste it into the prompt.",
+        "An empty answer skips GitHub, or stops without changes if GitHub is the only source.",
     ]);
     PluginMessage::Text {
         name: Q_TOKEN.into(),
-        query: format!("GitHub token with access to {}/{} (see the steps above):", key::GITHUB_OWNER, key::GITHUB_REPO),
+        query: format!("GitHub token with access to {}/{} (see the steps in the output):", key::GITHUB_OWNER, key::GITHUB_REPO),
     }
 }
 
@@ -324,14 +324,14 @@ fn ask_cookie() -> PluginMessage {
         "  3. Go to the Application tab (Chrome, Edge, Brave) or the Storage tab (Firefox, Safari).",
         "  4. Expand Cookies and select https://www.patreon.com.",
         "  5. Find the row named session_id and copy its Value.",
-        "  6. Paste it below.",
+        "  6. Paste it into the prompt.",
         "The cookie stops working if you log out of Patreon in that browser or when it expires (usually within",
         "a few weeks); run this plugin again and paste a fresh one. It is only ever sent to patreon.com.",
-        "Leave it blank to cancel.",
+        "An empty answer stops without changes.",
     ]);
     PluginMessage::Text {
         name: Q_COOKIE.into(),
-        query: "Patreon session_id cookie value (see the steps above):".into(),
+        query: "Patreon session_id cookie value (see the steps in the output):".into(),
     }
 }
 
