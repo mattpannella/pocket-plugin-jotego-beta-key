@@ -1,5 +1,5 @@
 {
   "name": "Jotego Beta Key",
-  "description": "Downloads Jotego's jtbeta.zip and extracts the beta key into Licenses/ so the beta cores can be installed. Fetches from the JTFPGA/jtbeta GitHub repo (needs a GitHub token with sponsor access) and/or from Jotego's Patreon (needs your Patreon session cookie). Asks for the source and credentials once and keeps them on the SD card in Plugins/jotego-beta-key/config.json. A jtbeta.zip or beta.bin you put in the root of the card is used instead and nothing is downloaded. Run before cores on every Update All.",
+  "description": "Downloads Jotego's jtbeta.zip and extracts the beta key into Licenses/ so the beta cores can be installed. Fetches from the JTFPGA/jtbeta GitHub repo (needs a GitHub token with sponsor access) and/or from Jotego's Patreon (needs your Patreon session cookie). Asks for the source and credentials once and keeps them on the SD card in Plugins/jotego-beta-key/config.json. A jtbeta.zip or beta.bin you put in the root of the card is used instead and nothing is downloaded. in pupdate, run before cores on every Update All.",
   "allowed_hosts": ["api.github.com", "raw.githubusercontent.com", "objects.githubusercontent.com", "www.patreon.com", "*.patreonusercontent.com"]
 }
