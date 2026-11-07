@@ -1,18 +1,18 @@
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::key::{self, Config, Probe, Source};
+use crate::protocol::HostMessage;
 
 const CARD: &str = "pocket";
 const LICENSES_DIR: &str = "pocket/Licenses";
 const PLUGIN_DIR: &str = "pocket/Plugins/jotego-beta-key";
 const CONFIG_FILE: &str = "config.json";
-const CACHED_ZIP: &str = "jtbeta.zip";
+const LEGACY_CACHED_ZIP: &str = "jtbeta.zip";
 const DEFAULT_GITHUB_API: &str = "https://api.github.com/";
 const DEFAULT_PATREON: &str = "https://www.patreon.com/";
-// Host config keys overriding the service URLs (only the headless test harness sets them).
 const GITHUB_API_CONFIG: &str = "github_api_url";
 const PATREON_CONFIG: &str = "patreon_url";
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -34,13 +34,6 @@ enum PluginMessage {
     Exit,
 }
 
-#[derive(Clone, Deserialize, FromBytes)]
-#[encoding(Json)]
-enum HostMessage {
-    Answer { name: String, value: String },
-    Kill,
-}
-
 #[host_fn]
 extern "ExtismHost" {
     fn open_url(url: &str) -> ();
@@ -55,8 +48,15 @@ fn println(msg: &str) {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct State {
+    // Working settings, including credentials entered this run. Written to config.json only by
+    // finish(), i.e. once a download has worked.
     config: Config,
-    // Credentials entered this run; written to config.json only once they worked.
+    // config.json as it was loaded: what a failed credential is reverted to, so a token that
+    // worked before is never thrown away because of one bad response
+    saved: Config,
+    // config.json exists but could not be read or parsed; never overwrite it
+    config_unreadable: bool,
+    // GitHub was already attempted (or skipped) this run. don't try it again after falling back.
     github_tried: bool,
 }
 
@@ -76,31 +76,54 @@ fn config_path() -> std::path::PathBuf {
     Path::new(PLUGIN_DIR).join(CONFIG_FILE)
 }
 
-fn load_config() -> Config {
-    fs::read_to_string(config_path()).map(|s| Config::parse(&s)).unwrap_or_default()
+//returns the config and whether config.json is unreadable (and so must not be overwritten).
+fn load_config() -> (Config, bool) {
+    let path = format!("Plugins/jotego-beta-key/{CONFIG_FILE}");
+    match fs::read_to_string(config_path()) {
+        Ok(text) => match Config::parse(&text) {
+            Ok(cfg) => (cfg, false),
+            Err(e) => {
+                println(&format!("{path} could not be parsed ({e}). It won't be changed. fix or delete it to save settings again."));
+                (Config::default(), true)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Config::default(), false),
+        Err(e) => {
+            println(&format!("Could not read {path} ({e}). It will not be changed."));
+            (Config::default(), true)
+        }
+    }
 }
 
 fn save_config(cfg: &Config) {
-    if fs::create_dir_all(PLUGIN_DIR).is_ok() {
+    if let Err(e) = fs::create_dir_all(PLUGIN_DIR) {
+        println(&format!("Could not create Plugins/jotego-beta-key: {e}"));
+    } else {
         if let Err(e) = fs::write(config_path(), cfg.to_json()) {
             println(&format!("Could not save Plugins/jotego-beta-key/{CONFIG_FILE}: {e}"));
         }
     }
 }
 
+// `name` may contain '/'-separated sub folders. returns false when the file already held `bytes`.
 fn write_file(dir: &str, name: &str, bytes: &[u8]) -> Result<bool, String> {
     let dest = Path::new(dir).join(name);
     if fs::read(&dest).map(|existing| existing == bytes).unwrap_or(false) {
         return Ok(false);
     }
-    fs::create_dir_all(dir).map_err(|e| format!("could not create {dir}: {e}"))?;
-    let part = Path::new(dir).join(format!("{name}.part"));
-    fs::write(&part, bytes).map_err(|e| format!("could not write {}: {e}", part.display()))?;
-    fs::rename(&part, &dest).map_err(|e| format!("could not replace {}: {e}", dest.display()))?;
-    Ok(true)
+    let parent = dest.parent().unwrap_or(Path::new(dir));
+    fs::create_dir_all(parent).map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    let part = PathBuf::from(format!("{}.part", dest.display()));
+    let result = fs::write(&part, bytes)
+        .map_err(|e| format!("could not write {}: {e}", part.display()))
+        .and_then(|()| fs::rename(&part, &dest).map_err(|e| format!("could not replace {}: {e}", dest.display())));
+    if result.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    result.map(|()| true)
 }
 
-// Unpack the key file(s) into Licenses/; returns how many changed.
+// Unpack the key files into Licenses/; returns how many changed.
 fn install_zip(zip: &[u8]) -> Result<usize, String> {
     let mut changed = 0;
     for (name, data) in key::extract_zip(zip)? {
@@ -112,16 +135,17 @@ fn install_zip(zip: &[u8]) -> Result<usize, String> {
     Ok(changed)
 }
 
-// A jtbeta.zip or beta.bin dropped into the root of the card wins over any download.
+// A jtbeta.zip or beta.bin in the root of the card wins over any download, same behavior from pupdate
+// (CoresService.RetrieveKeys only auto fetches when ExtractJTBetaKey found nothing).
 fn try_manual_key() -> Option<Result<(), String>> {
     let zip = Path::new(CARD).join(key::KEY_ZIP);
     if let Ok(bytes) = fs::read(&zip) {
-        println(&format!("{} found in the root of the SD card; using it (nothing downloaded).", key::KEY_ZIP));
+        println(&format!("{} found in the root of the SD card, using it (nothing downloaded).", key::KEY_ZIP));
         return Some(install_zip(&bytes).map(|_| ()));
     }
     let bin = Path::new(CARD).join(key::KEY_BIN);
     if let Ok(bytes) = fs::read(&bin) {
-        println(&format!("{} found in the root of the SD card; using it (nothing downloaded).", key::KEY_BIN));
+        println(&format!("{} found in the root of the SD card, using it (nothing downloaded).", key::KEY_BIN));
         return Some(write_file(LICENSES_DIR, key::KEY_BIN, &bytes).map(|_| ()));
     }
     None
@@ -132,9 +156,17 @@ enum FetchError {
     Other(String),
 }
 
+fn send(req: &HttpRequest) -> Result<HttpResponse, String> {
+    http::request::<()>(req, None).map_err(|e| format!("request failed: {e}"))
+}
+
 fn get(req: HttpRequest) -> Result<(u16, Vec<u8>), String> {
-    let res = http::request::<()>(&req, None).map_err(|e| format!("request failed: {e}"))?;
+    let res = send(&req)?;
     Ok((res.status_code(), res.body()))
+}
+
+fn header_is(res: &HttpResponse, name: &str, value: &str) -> bool {
+    res.headers().iter().any(|(k, v)| k.eq_ignore_ascii_case(name) && v.trim() == value)
 }
 
 fn fetch_github(token: &str) -> Result<Vec<u8>, FetchError> {
@@ -143,15 +175,33 @@ fn fetch_github(token: &str) -> Result<Vec<u8>, FetchError> {
         .with_header("User-Agent", "pocket-plugin-jotego-beta-key/0.1")
         .with_header("Accept", "application/vnd.github.raw")
         .with_header("Authorization", format!("token {}", token.trim()));
-    match get(req).map_err(FetchError::Other)? {
-        (200, body) if !body.is_empty() => Ok(body),
-        (200, _) => Err(FetchError::Other("GitHub returned an empty file".into())),
-        (401 | 403 | 404, _) => Err(FetchError::Auth(format!(
-            "GitHub refused the token for {}/{}: it may be wrong, expired, or your account has no sponsor access to the repo",
-            key::GITHUB_OWNER,
-            key::GITHUB_REPO
+    let res = send(&req).map_err(FetchError::Other)?;
+    let repo = format!("{}/{}", key::GITHUB_OWNER, key::GITHUB_REPO);
+    match res.status_code() {
+        200 => {
+            let body = res.body();
+            if body.is_empty() {
+                Err(FetchError::Other("GitHub returned an empty file".into()))
+            } else {
+                Ok(body)
+            }
+        }
+        // A rate limit says nothing about the token, so it must not be treated as a bad one.
+        403 | 429 if header_is(&res, "x-ratelimit-remaining", "0") => {
+            Err(FetchError::Other("GitHub's API rate limit was reached, try again later".into()))
+        }
+        429 => Err(FetchError::Other("GitHub is rate limiting requests, try again later".into())),
+        401 => Err(FetchError::Auth("GitHub rejected the token: it may be wrong, expired or revoked".into())),
+        403 => Err(FetchError::Auth(format!(
+            "GitHub refused access to {repo}: the token may lack the needed scope or SSO authorisation"
         ))),
-        (status, _) => Err(FetchError::Other(format!("GitHub returned HTTP {status}"))),
+        // GitHub reports a private repo the token can't see as 404, so this is usually missing
+        // sponsor access; it can also mean the file moved.
+        404 => Err(FetchError::Auth(format!(
+            "{} was not found in {repo}: the token's account may not have sponsor access (or the file has moved)",
+            key::KEY_ZIP
+        ))),
+        status => Err(FetchError::Other(format!("GitHub returned HTTP {status}"))),
     }
 }
 
@@ -169,7 +219,7 @@ fn fetch_patreon(cookie: &str) -> Result<(Vec<u8>, String), FetchError> {
         return Err(FetchError::Other(format!("failed to load the Patreon page for '{}' (HTTP {status})", key::PATREON_VANITY)));
     }
     let campaign = key::campaign_id(&String::from_utf8_lossy(&html))
-        .ok_or_else(|| FetchError::Other("could not find the campaign id on the Patreon page; Patreon may have changed its page structure".into()))?;
+        .ok_or_else(|| FetchError::Other("could not find the campaign id on the Patreon page. Patreon may have changed its page structure".into()))?;
 
     let mut next = Some(key::patreon_posts_url(&base, &campaign));
     for _ in 0..key::MAX_PAGES {
@@ -177,7 +227,7 @@ fn fetch_patreon(cookie: &str) -> Result<(Vec<u8>, String), FetchError> {
         let (status, body) = get(patreon_req(&url, cookie)).map_err(FetchError::Other)?;
         match status {
             200 => {}
-            401 | 403 => return Err(FetchError::Auth("Patreon rejected the session cookie; it may be expired - copy a fresh one from your browser".into())),
+            401 | 403 => return Err(FetchError::Auth("Patreon rejected the session cookie, it may be expired. copy a fresh one from your browser".into())),
             s => return Err(FetchError::Other(format!("Patreon posts request failed (HTTP {s})"))),
         }
         match key::probe_posts_page(&String::from_utf8_lossy(&body), key::KEY_ZIP).map_err(FetchError::Other)? {
@@ -191,7 +241,7 @@ fn fetch_patreon(cookie: &str) -> Result<(Vec<u8>, String), FetchError> {
             // The cookie worked; re-entering it wouldn't help, so this isn't an Auth failure.
             Probe::Gated(post) => {
                 return Err(FetchError::Other(format!(
-                    "found a post with {} ({post}) but this account can't view it; your tier may not include beta access",
+                    "found a post with {} ({post}) but this account can't view it. your tier may not include beta access",
                     key::KEY_ZIP
                 )))
             }
@@ -207,16 +257,20 @@ fn fetch_patreon(cookie: &str) -> Result<(Vec<u8>, String), FetchError> {
 }
 
 fn finish(state: &mut State, zip: &[u8], from: &str) -> PluginMessage {
-    let cached = write_file(PLUGIN_DIR, CACHED_ZIP, zip).unwrap_or(true);
     match install_zip(zip) {
-        Ok(0) if !cached => println(&format!("Licenses/ is already up to date (checked {from}).")),
+        Ok(0) => println(&format!("Licenses/ is already up to date (checked {from}).")),
         Ok(_) => println(&format!("Jotego beta key installed from {from}.")),
         Err(e) => {
             println(&format!("Downloaded {} from {from} but could not extract it: {e}", key::KEY_ZIP));
             return PluginMessage::Exit;
         }
     }
-    save_config(&state.config);
+    let _ = fs::remove_file(Path::new(PLUGIN_DIR).join(LEGACY_CACHED_ZIP));
+    if state.config_unreadable {
+        println(&format!("Settings were not saved because Plugins/jotego-beta-key/{CONFIG_FILE} could not be parsed."));
+    } else if state.config != state.saved {
+        save_config(&state.config);
+    }
     PluginMessage::Exit
 }
 
@@ -255,14 +309,23 @@ fn advance(state: &mut State) -> PluginMessage {
     let Some(source) = state.config.source else { return ask_source() };
 
     if source.uses_github() && !state.github_tried {
-        let Some(token) = state.config.github_token.clone() else { return ask_token() };
+        let token = state.config.github_token.clone().filter(|t| !t.trim().is_empty());
+        let Some(token) = token else {
+            if source == Source::Both && state.config.patreon_session_id.is_some() {
+                println("No GitHub token is saved; trying Patreon.");
+                state.github_tried = true;
+                return advance(state);
+            }
+            return ask_token();
+        };
         println(&format!("Fetching {} from GitHub ({}/{})...", key::KEY_ZIP, key::GITHUB_OWNER, key::GITHUB_REPO));
         state.github_tried = true;
         match fetch_github(&token) {
             Ok(zip) => return finish(state, &zip, "GitHub"),
             Err(FetchError::Auth(msg)) => {
                 println(&format!("GitHub fetch failed: {msg}."));
-                state.config.github_token = None;
+                //drop a token entered this run, but keep one that was already saved.
+                state.config.github_token = state.saved.github_token.clone();
                 if source == Source::Github {
                     return ask_retry(Q_RETRY_GITHUB, "The GitHub token");
                 }
@@ -285,7 +348,7 @@ fn advance(state: &mut State) -> PluginMessage {
             Ok((zip, post)) => return finish(state, &zip, &format!("Patreon ({post})")),
             Err(FetchError::Auth(msg)) => {
                 println(&format!("Patreon fetch failed: {msg}."));
-                state.config.patreon_session_id = None;
+                state.config.patreon_session_id = state.saved.patreon_session_id.clone();
                 return ask_retry(Q_RETRY_PATREON, "The Patreon session cookie");
             }
             Err(FetchError::Other(msg)) => println(&format!("Patreon fetch failed: {msg}.")),
@@ -304,14 +367,15 @@ pub fn start() -> FnResult<PluginMessage> {
         }
         return Ok(PluginMessage::Exit);
     }
-    let mut state = State { config: load_config(), github_tried: false };
+    let (config, config_unreadable) = load_config();
+    let mut state = State { saved: config.clone(), config, config_unreadable, github_tried: false };
     let message = advance(&mut state);
     save_state(&state);
     Ok(message)
 }
 
 #[plugin_fn]
-pub fn handle_response(input: HostMessage) -> FnResult<PluginMessage> {
+pub fn handle_response(Json(input): Json<HostMessage>) -> FnResult<PluginMessage> {
     let mut state = load_state();
     let message = match input {
         HostMessage::Kill => {
@@ -327,8 +391,14 @@ pub fn handle_response(input: HostMessage) -> FnResult<PluginMessage> {
                 None => ask_source(),
             },
             Q_TOKEN if value.trim().is_empty() => {
-                println("No token given; nothing changed.");
-                PluginMessage::Exit
+                if state.config.source == Some(Source::Both) {
+                    println("No token given; skipping GitHub.");
+                    state.github_tried = true;
+                    advance(&mut state)
+                } else {
+                    println("No token given; nothing changed.");
+                    PluginMessage::Exit
+                }
             }
             Q_TOKEN => {
                 state.config.github_token = Some(value.trim().to_string());

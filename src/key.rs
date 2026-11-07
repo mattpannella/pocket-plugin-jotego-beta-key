@@ -17,8 +17,12 @@ pub const MAX_PAGES: usize = 5;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
+    // Aliases so a hand-edited config.json with "GitHub" etc. still loads.
+    #[serde(alias = "GitHub", alias = "Github", alias = "GITHUB")]
     Github,
+    #[serde(alias = "Patreon", alias = "PATREON")]
     Patreon,
+    #[serde(alias = "Both", alias = "BOTH")]
     Both,
 }
 
@@ -42,7 +46,7 @@ impl Source {
     }
 }
 
-// Stored on the card at Plugins/jotego-beta-key/config.json (so it follows the SD card).
+// Stored on the card at Plugins/jotego-beta-key/config.json
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,8 +58,8 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn parse(json: &str) -> Config {
-        serde_json::from_str(json).unwrap_or_default()
+    pub fn parse(json: &str) -> Result<Config, String> {
+        serde_json::from_str(json).map_err(|e| e.to_string())
     }
 
     pub fn to_json(&self) -> String {
@@ -79,7 +83,7 @@ pub fn patreon_posts_url(base: &str, campaign_id: &str) -> String {
     )
 }
 
-// The campaign id is embedded in the creator page's bootstrap JSON as "id":"123","type":"campaign".
+//the campaign id is embedded in the creator page's bootstrap JSON as "id":"123","type":"campaign".
 pub fn campaign_id(html: &str) -> Option<String> {
     let re = Regex::new(r#""id"\s*:\s*"(\d+)"\s*,\s*"type"\s*:\s*"campaign""#).ok()?;
     re.captures(html).map(|c| c[1].to_string())
@@ -111,10 +115,12 @@ pub fn probe_posts_page(json: &str, filename: &str) -> Result<Probe, String> {
     let mut gated: Option<String> = None;
 
     for post in doc.get("data").and_then(Value::as_array).unwrap_or(&empty) {
+        //fall back to `attachments` when `attachments_media.data`
+        // is missing or not an array (e.g. null).
         let rels = post
             .pointer("/relationships/attachments_media/data")
-            .or_else(|| post.pointer("/relationships/attachments/data"))
             .and_then(Value::as_array)
+            .or_else(|| post.pointer("/relationships/attachments/data").and_then(Value::as_array))
             .unwrap_or(&empty);
         for rel in rels {
             let Some(item) = rel.get("id").and_then(Value::as_str).and_then(media) else { continue };
@@ -145,7 +151,8 @@ pub fn probe_posts_page(json: &str, filename: &str) -> Result<Probe, String> {
     Ok(Probe::NotFound { next })
 }
 
-// Every file in the zip, flattened to its file name (jtbeta.zip holds beta.bin at the root).
+pub const MAX_ENTRY_SIZE: u64 = 16 * 1024 * 1024;
+
 pub fn extract_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("not a zip file: {e}"))?;
     let mut files = Vec::new();
@@ -154,13 +161,18 @@ pub fn extract_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         if entry.is_dir() {
             continue;
         }
-        let name = std::path::Path::new(entry.name())
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| !n.is_empty() && !n.starts_with('.'));
-        let Some(name) = name else { continue };
-        let mut data = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut data).map_err(|e| format!("could not read {name} from the zip: {e}"))?;
+        let name = safe_entry_path(entry.name()).ok_or_else(|| format!("unsafe path in the zip: {}", entry.name()))?;
+        if name.split('/').any(|part| part.starts_with('.') || part == "__MACOSX") {
+            continue;
+        }
+        let mut data = Vec::with_capacity(entry.size().min(MAX_ENTRY_SIZE) as usize);
+        (&mut entry)
+            .take(MAX_ENTRY_SIZE + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| format!("could not read {name} from the zip: {e}"))?;
+        if data.len() as u64 > MAX_ENTRY_SIZE {
+            return Err(format!("{name} in the zip is larger than {} MiB", MAX_ENTRY_SIZE / 1024 / 1024));
+        }
         files.push((name, data));
     }
     if files.is_empty() {
@@ -169,18 +181,38 @@ pub fn extract_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(files)
 }
 
+
+fn safe_entry_path(raw: &str) -> Option<String> {
+    let unified = raw.replace('\\', "/");
+    if unified.starts_with('/') || unified.split('/').next().is_some_and(|first| first.contains(':')) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in unified.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            p => parts.push(p),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
     #[test]
-    fn config_round_trips_and_tolerates_garbage() {
+    fn config_round_trips_and_rejects_garbage() {
         let c = Config { source: Some(Source::Both), github_token: Some("t".into()), patreon_session_id: None };
         let json = c.to_json();
         assert!(json.contains("\"both\"") && !json.contains("patreon_session_id"));
-        assert_eq!(Config::parse(&json), c);
-        assert_eq!(Config::parse("nonsense"), Config::default());
+        assert_eq!(Config::parse(&json), Ok(c));
+        assert!(Config::parse("nonsense").is_err());
+        assert!(Config::parse(r#"{"source":"github",}"#).is_err());
+        assert_eq!(Config::parse(r#"{"source":"GitHub"}"#).unwrap().source, Some(Source::Github));
+        assert_eq!(Config::parse("{}"), Ok(Config::default()));
         assert_eq!(Source::from_choice("Patreon (your session cookie)"), Some(Source::Patreon));
         assert!(Source::Both.uses_github() && Source::Both.uses_patreon() && !Source::Github.uses_patreon());
     }
@@ -235,7 +267,20 @@ mod tests {
     }
 
     #[test]
-    fn zip_entries_are_flattened() {
+    fn null_attachments_media_falls_back_to_attachments() {
+        let page = r#"{
+          "data": [ { "attributes": { "url": "p", "current_user_can_view": true },
+                      "relationships": { "attachments_media": { "data": null }, "attachments": { "data": [ { "id": "m1" } ] } } } ],
+          "included": [ { "type": "media", "id": "m1", "attributes": { "file_name": "jtbeta.zip", "download_url": "u" } } ]
+        }"#;
+        assert_eq!(
+            probe_posts_page(page, "jtbeta.zip").unwrap(),
+            Probe::Found(Attachment { post_url: "p".into(), download_url: "u".into() })
+        );
+    }
+
+    #[test]
+    fn zip_entries_keep_their_paths() {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut buf);
@@ -245,10 +290,44 @@ mod tests {
             w.write_all(b"KEYBYTES").unwrap();
             w.start_file("readme.txt", opts).unwrap();
             w.write_all(b"hi").unwrap();
+            w.start_file("__MACOSX/._beta.bin", opts).unwrap();
+            w.write_all(b"junk").unwrap();
+            w.start_file("win\\beta.bin", opts).unwrap();
+            w.write_all(b"W").unwrap();
             w.finish().unwrap();
         }
         let files = extract_zip(&buf.into_inner()).unwrap();
-        assert_eq!(files, vec![("beta.bin".to_string(), b"KEYBYTES".to_vec()), ("readme.txt".to_string(), b"hi".to_vec())]);
+        assert_eq!(
+            files,
+            vec![
+                ("sub/beta.bin".to_string(), b"KEYBYTES".to_vec()),
+                ("readme.txt".to_string(), b"hi".to_vec()),
+                ("win/beta.bin".to_string(), b"W".to_vec()),
+            ]
+        );
         assert!(extract_zip(b"not a zip").is_err());
+    }
+
+    #[test]
+    fn oversized_entries_are_rejected() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("beta.bin", opts).unwrap();
+            w.write_all(&vec![0u8; (MAX_ENTRY_SIZE + 1) as usize]).unwrap();
+            w.finish().unwrap();
+        }
+        let err = extract_zip(&buf.into_inner()).unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+    }
+
+    #[test]
+    fn unsafe_zip_paths_are_rejected() {
+        assert_eq!(safe_entry_path("a/./b.bin").as_deref(), Some("a/b.bin"));
+        assert_eq!(safe_entry_path("../evil"), None);
+        assert_eq!(safe_entry_path("a\\..\\..\\evil"), None);
+        assert_eq!(safe_entry_path("/etc/passwd"), None);
+        assert_eq!(safe_entry_path("C:\\x"), None);
     }
 }
